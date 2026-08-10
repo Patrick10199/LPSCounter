@@ -38,23 +38,40 @@ where (or whether) to look next — and, at long odds, the counterexample.
 - **In-memory only.** The pair-key table (8 bytes × ~B²/2) must fit in RAM.
   Scaling beyond RAM is explicitly out of scope for v1.
 
-## Prior art (audited 2026-08-09)
+## Prior art and implied coverage (audited 2026-08-09)
 
-| System | Best published bound | Source |
+| System | Bound | Source / status |
 |---|---|---|
-| (6,3,2) exact | common sum ≤ 1.15×10^16 (max base ≈ 475) | Ekl, Math. Comp. 67 (1998) |
-| (6,3,2) exact, earlier | common sum ≤ 4×10^12 (max base ≈ 126) | Lander–Parkin–Selfridge, Math. Comp. 21 (1967) |
-| (6,3,2; ±1) near misses | exhaustive to radius 17,800; exactly 5 known, all +1 (Wroblewski) | Moore via Piezas (secondhand claim) |
-| (6,2,2) | no solution, common sum ≤ 7.25×10^26 (max base ≈ 27k) | Ekl 1998, Table 9 |
+| (6,3,2) exact, explicit | common sum ≤ 1.15×10^16 (max base ≈ 475) | Ekl, Math. Comp. 67 (1998) |
+| (6,3,2) exact, IMPLIED | bases < 33,225 (via (6,3,3) coverage with a zero term, per the archive's 0 ≤ x_i convention) | Moore's (6,3,3) archive claim (contributor-reported) |
+| (6,3,2; +1) misses, IMPLIED | bases < 33,225 (a +1 miss is a (6,3,3) solution with a 1^6 term) | same |
+| (6,3,2; −1) misses | radius 17,800 (secondhand); a −1 miss is (6,4,2)-shaped, NOT covered by (6,3,3) | Moore via Piezas |
+| (6,2,2) | sum ≤ 2^96 (max base ≈ 58,385) | Schoenfield, OEIS A046881 |
 
-Notation trap: LPS/Ekl write our (6,3,2) as (6.2.3). The powersums site's
-(6,3,2;±1) coverage slot is empty as of 2026-08-09; no modern exact-(6,3,2)
-bound is published anywhere we could find. A B=150,000 run is ~300× past the
-exact frontier in base terms and ~8× past the near-miss frontier.
+Notation trap: LPS/Ekl write our (6,3,2) as (6.2.3). Archive claims are
+contributor-reported and not independently verified; implied-coverage rows
+depend on the archive's zero-term convention and are labeled accordingly.
 
-Caveat: whether the 2011 BOINC (6,2,5) search (all terms < 250,000) admitted
-two zero terms — which would imply (6,3,2) coverage at that level — is
-explicitly unverified. Treat Ekl 1998 as the exact frontier.
+## Results to date (2026-08-09)
+
+An INTERNALLY CROSS-VERIFIED (two oracles by the same author — not
+independent third-party verification) exhaustive search found:
+
+- No new (6,3,2;±1) identity for bases below 30,001, recovering all five
+  known +1 identities and finding no −1 identity. Relative to prior work this
+  is the first explicit archive-format coverage of the combined ±1 residuals
+  and, on the −1 side, an extension of Moore's secondhand radius-17,800
+  claim; the +1 side below 30,001 is implied by existing (6,3,3) coverage.
+- No (6,3,2) solution with all bases below 50,001 (B=150,001 in progress) —
+  ~1.5× past the implied (6,3,3)-derived frontier of 33,225, ~105× past
+  Ekl's explicit 1998 bound (comparisons labeled, not conflated).
+- The (2,2) byproduct scan found no repeated pair sums, consistent with (and
+  below) Schoenfield's 2^96 bound; it is NOT a record and the admissibility
+  argument for the exact campaign's pair filtering is spelled out in
+  lps632.cpp before any (2,2) claim should be made from it.
+- A deterministic 1/256-column SAMPLED residual corpus (millions of signed
+  gap records, |lhs−rhs| ≤ 2^40) accompanies each run — a sampled instrument,
+  never gap-coverage, and not claimed as a first without a literature audit.
 
 ## Build & run (Linux; g++ with __int128 and OpenMP)
 
