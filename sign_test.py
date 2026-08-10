@@ -7,8 +7,12 @@ s3 < s2 (delta < 0) equally common at each scale of |delta|? The five known
 delta<0 side is depressed, that is one mechanism; if parity holds except at
 tiny |delta|, the obstruction is arithmetic and possibly provable.
 
-Density-gradient bias is negligible here (relative pair-density change across
-a 2^40 window at scale 10^18+ is ~1e-6), so raw counts are a clean test.
+WARNING (audit-corrected): density-gradient bias is NOT negligible — record
+mass concentrates at s3 within a few multiples of 2^40, where pair-sum density
+varies by O(1) across the window. The engine-faithful null is a large,
+s3-dependent curvature profile (deep negative at small s3, ~+0.48 peak near
+s3 ~ 2^40, decaying to 0), NOT 50/50. Compare against that null (see
+census_504.py binned output), never against 0.5.
 
 Usage: python3 sign_test.py results.jsonl [results2.jsonl ...]
 """
