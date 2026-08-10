@@ -1,0 +1,8 @@
+﻿selftest_tmp*/
+run_*/
+*.exe
+*.o
+lps632
+lps632_asan
+lps632-1*
+bench.log
