@@ -79,7 +79,7 @@ typedef uint32_t u32;
 typedef uint64_t u64;
 typedef unsigned __int128 u128;
 
-static const char *CODE_VERSION = "lps632-1.4.1";
+static const char *CODE_VERSION = "lps632-1.5.0";
 
 // ---------------------------------------------------------------- utilities
 
@@ -237,13 +237,18 @@ struct Params {
   bool quiet = false;
   bool noBloom = false;      // disable the Bloom prefilter (bench comparison)
   bool inMemoryOnly = false; // selftest/bench: no files
+  int gpuWindows = 0;        // GPU engine: value-space window count (0 = CPU/single)
   std::string outDir = "";
 
   std::string configString() const {
     char buf[512];
-    snprintf(buf, sizeof buf,
+    int n = snprintf(buf, sizeof buf,
              "%s|K=%d|Bexcl=%" PRIu64 "|near=%d|sampleShift=%d|deltaBits=%d|keyShiftExtra=%d|tiles=%d",
              CODE_VERSION, K, B, near, sampleShift, deltaBits, keyShiftExtra, tiles);
+    // window plan is part of the coverage identity: resume with a different
+    // plan must be refused (GPU_DESIGN.md; layout never derives from free VRAM)
+    if (gpuWindows > 0 && n > 0 && n < (int)sizeof buf)
+      snprintf(buf + n, sizeof buf - n, "|gpuWindows=%d", gpuWindows);
     return buf;
   }
   std::string configHash() const { return SHA256::of(configString()); }
@@ -934,9 +939,12 @@ struct Engine {
       if (!strchr(line, '\n')) continue; // torn append (crash mid-write): line is not trustworthy
       char hash[80];
       int tid;
+      size_t tot;
       if (sscanf(line, "config %64s", hash) == 1 && strlen(hash) == 64) {
         if (P.configHash() != hash) { fclose(mf); err = "manifest config hash mismatch"; return false; }
         headerOk = true;
+      } else if (sscanf(line, "total %zu", &tot) == 1) {
+        if (tot != tileDone.size()) { fclose(mf); err = "manifest tile-count mismatch (layout change?)"; return false; }
       } else if (sscanf(line, "done %d", &tid) == 1) {
         if (tid >= 0 && (size_t)tid < tileDone.size()) tileDone[tid] = 1;
       }
@@ -978,6 +986,7 @@ struct Engine {
       manifestF = fopen(mp.c_str(), "w");
       if (manifestF) {
         if (fprintf(manifestF, "config %s %s\n", P.configHash().c_str(), P.configString().c_str()) < 0 ||
+            fprintf(manifestF, "total %zu\n", tileMass.size()) < 0 ||
             fflush(manifestF) != 0 || fsync(fileno(manifestF)) != 0)
           die("manifest header write failed");
         int dfd = open(P.outDir.c_str(), O_RDONLY | O_DIRECTORY);
@@ -1128,10 +1137,12 @@ struct Engine {
       if (!mf) die("merge: no manifest.txt in %s", P.outDir.c_str());
       char line[600];
       std::vector<int> doneIds;
+      size_t totalTiles = 0;
       while (fgets(line, sizeof line, mf)) {
         if (!strchr(line, '\n')) continue;
         char hash[80];
         int tid;
+        size_t tot;
         if (sscanf(line, "config %64s", hash) == 1 && strlen(hash) == 64) {
           cfgHash = hash;
           const char *rest = strchr(line, ' ');
@@ -1140,11 +1151,26 @@ struct Engine {
             cfgStr = rest + 1;
             while (!cfgStr.empty() && (cfgStr.back() == '\n' || cfgStr.back() == '\r')) cfgStr.pop_back();
           }
-        } else if (sscanf(line, "done %d", &tid) == 1)
+        } else if (sscanf(line, "total %zu", &tot) == 1)
+          totalTiles = tot;
+        else if (sscanf(line, "done %d", &tid) == 1)
           doneIds.push_back(tid);
       }
       fclose(mf);
       gapPop = cfgStr.find("near=1") != std::string::npos ? "all-pairs" : "admissible-pairs-only";
+      // completeness gate: a merged results.jsonl must cover every tile, or
+      // a dual-engine/dual-GPU partial run could silently masquerade as done
+      if (totalTiles > 0) {
+        std::vector<u8> seen(totalTiles, 0);
+        for (int id : doneIds)
+          if (id >= 0 && (size_t)id < totalTiles) seen[id] = 1;
+        size_t missing = 0;
+        for (size_t i = 0; i < totalTiles; i++) missing += !seen[i];
+        if (missing)
+          die("merge: %zu of %zu tiles not marked done — incomplete run; rerun search --resume before merging",
+              missing, totalTiles);
+      } else
+        fprintf(stderr, "merge WARNING: manifest has no 'total' line (pre-1.5.0 run) — completeness not verifiable\n");
       for (int id : doneIds) {
         FILE *tf = fopen(tilePath(id, false).c_str(), "r");
         if (!tf)
@@ -1655,6 +1681,7 @@ static std::vector<u64> parseList(const char *s) {
   return v;
 }
 
+#ifndef LPS632_GPU_EMBED
 int main(int argc, char **argv) {
   if (argc < 2) {
     fprintf(stderr, "usage: %s selftest | bench --B list | search --B n --near 0|1 [opts] | merge --outdir D\n",
@@ -1718,3 +1745,4 @@ int main(int argc, char **argv) {
   die("unknown command %s", cmd.c_str());
   return 1;
 }
+#endif // LPS632_GPU_EMBED
