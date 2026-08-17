@@ -6,3 +6,7 @@ lps632
 lps632_asan
 lps632-1*
 bench.log
+
+artifacts/**/results.jsonl
+measure_w0/
+*.o
