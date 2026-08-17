@@ -1,5 +1,29 @@
 #!/usr/bin/env python3
-"""R(0): local congruence suppression of exact (6,3,2) solutions vs the +1 channel.
+"""SUPERSEDED — kept for the audit trail. Use r0_indep.py instead.
+
+Two errors make this script's extended products wrong for PRIMITIVE solutions:
+
+  1. It sums only primes p == 1 (mod 6). Primes p == 5 (mod 6) also contribute:
+     there gcd(6, p-1) = 2, so x^6 = (x^3)^2 ranges over the quadratic
+     residues — still non-uniform, still a density factor.
+  2. It uses N(1)/N(0) for the exact channel. The primitive factor is
+     N(1)/(N(0) - 1): the all-zero residue tuple must be removed, since every
+     base divisible by p is exactly the non-primitive configuration the
+     coverage argument already excludes. (For t = +-1 primitivity is automatic.)
+
+The "extended product R(0) ~ 70 / R(-1) ~ 712" reported in commit 354d305 came
+from this script and is WITHDRAWN. Corrected partial products with primitive
+conditioning, prime-power ladders, and all primes are R(0) ~ 138, R(-1) ~ 864
+(no rigorous tail bound). See r0_indep.py and the Corrections section of
+README.md.
+
+The CORE per-modulus algebra below (mod 8, 9, 7, 13) is correct and agrees with
+the independent implementation; only the primitive normalization and the prime
+selection are wrong.
+
+Original docstring follows.
+
+R(0): local congruence suppression of exact (6,3,2) solutions vs the +1 channel.
 
 Part 1 — exact model: for each modulus m, distribute delta = X1+X2+X3-Y1-Y2
 with each variable drawn from the multiset {x^6 mod m : x in [0,m)} (all-pairs
