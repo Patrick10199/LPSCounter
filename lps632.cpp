@@ -211,6 +211,10 @@ static double memAvailableGB() {
 #endif
 }
 
+// instrumentation only: counts a-loop iterations inside collectPairsInRange so
+// verify cost can be MEASURED per recovery instead of estimated
+static thread_local u64 tl_aIters = 0;
+
 // deterministic sampling predicate for the unfiltered gap stream; replicated
 // exactly by the oracles (C++ and Python). Samples 2^-shift of (x,y) columns.
 static inline bool sampledXY(u64 x, u64 y, int shift) {
@@ -355,7 +359,8 @@ struct Engine {
 
   struct Stats {
     u64 iters = 0, chainPass = 0, keySearches = 0, keyMatches = 0, recoveries = 0,
-        sampledProbes = 0, exactHits = 0, nearHits = 0, gapReports = 0, degenerateSkipped = 0;
+        sampledProbes = 0, exactHits = 0, nearHits = 0, gapReports = 0, degenerateSkipped = 0,
+        aIters = 0; // a-loop iterations inside collectPairsInRange (verify cost)
   };
   Stats total;
 
@@ -669,6 +674,7 @@ struct Engine {
     if (POW[a] < halfCeil) a++;
     if (a < 1) a = 1;
     for (; a <= Bmax; a++) {
+      tl_aIters++;
       if (POW[a] > hi - 1) break;
       u128 bl = lo > POW[a] ? lo - POW[a] : 1;
       u128 bh = hi - POW[a];
@@ -1005,6 +1011,7 @@ struct Engine {
       total.recoveries += tb.st.recoveries; total.sampledProbes += tb.st.sampledProbes;
       total.exactHits += tb.st.exactHits; total.nearHits += tb.st.nearHits;
       total.gapReports += tb.st.gapReports; total.degenerateSkipped += tb.st.degenerateSkipped;
+      total.aIters += tb.st.aIters;
     }
     if (P.inMemoryOnly) return;
 #ifdef __unix__
@@ -1243,11 +1250,15 @@ struct Engine {
     if (!sf) die("merge: stats write failed");
     fprintf(sf, "{\"version\":\"%s\",\"config\":\"%s\",\"configSha256\":\"%s\",\"records\":%zu"
                 ",\"iters\":%" PRIu64 ",\"chainPass\":%" PRIu64 ",\"keySearches\":%" PRIu64
-                ",\"sampledProbes\":%" PRIu64 ",\"gapPopulation\":\"%s\",\"gapHistogramLog2\":[",
+                ",\"sampledProbes\":%" PRIu64 ",\"gapPopulation\":\"%s\",\"nearestKeyGapHistogramLog2\":[",
             CODE_VERSION, cfgStr.c_str(), cfgHash.c_str(), records.size(),
             mIters, mChainPass, mKeySearches, mSampled, gapPop.c_str());
     for (int i = 0; i < 128; i++) fprintf(sf, "%s%" PRIu64, i ? "," : "", mergedHist[i]);
-    fprintf(sf, "]}\n");
+    // NOTE: bins are log2 of the distance between TRUNCATED KEYS shifted back,
+    // not exact nearest-gap distances. Bin 0 means "a pair sum shares the
+    // probe's key bucket", NOT "|delta| <= 1". Emitted gap records are exact;
+    // this histogram is key-quantized. Hence the field name.
+    fprintf(sf, "],\"nearestKeyGapHistogramLog2_note\":\"key-quantized: bin 0 = same truncated-key bucket, not exact gap 0\"}\n");
     if (fclose(sf) != 0) die("merge: stats close failed");
     if (!P.quiet)
       fprintf(stderr, "merged %zu records -> %s (sha256 %s)\n", records.size(), rp.c_str(), rhash.c_str());

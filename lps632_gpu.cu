@@ -62,8 +62,10 @@ struct KernelArgs {
   const u64 *colBase;
   u64 nCols;
   DevCand *out;
-  u32 *outCount;
-  u32 outCap;
+  unsigned long long *outCount; // 64-bit: a 32-bit counter can wrap at 2^32
+                                // and a wrapped value below the cap would look
+                                // like success while candidates were dropped
+  u64 outCap;
   unsigned long long *iterCount;
 };
 
@@ -194,7 +196,7 @@ __global__ void probeKernel(KernelArgs A) {
           found |= 4;
       }
       if (found) {
-        u32 slot = atomicAdd(A.outCount, 1u);
+        unsigned long long slot = atomicAdd(A.outCount, 1ull);
         if (slot < A.outCap) A.out[slot] = {(u32)x, (u32)y, (u32)z, found};
       }
     }
@@ -228,17 +230,17 @@ static void buildSliceBloom(const u64 *keys, u64 n, std::vector<u64> &bits, u64 
 
 struct DevCtx {
   int device = 0;
-  u32 candCap = 0;
+  u64 candCap = 0;
   du128 *dPOW = nullptr;
   u64 *dKeys = nullptr, *dBucketOfs = nullptr, *dBloom = nullptr, *dColBase = nullptr;
   u16 *dRAll = nullptr;
   u8 *dFAll = nullptr;
   DevCand *dOut = nullptr;
-  u32 *dOutCount = nullptr;
+  unsigned long long *dOutCount = nullptr;
   unsigned long long *dIter = nullptr;
   u64 keysCapBytes = 0, bloomCapBytes = 0;
 
-  void init(Engine &e, int dev, u32 cap, u64 maxSliceKeys, const std::vector<u16> &rAll,
+  void init(Engine &e, int dev, u64 cap, u64 maxSliceKeys, const std::vector<u16> &rAll,
             const std::vector<u8> &fAll) {
     device = dev;
     candCap = cap;
@@ -256,8 +258,8 @@ struct DevCtx {
     CUCHECK(cudaMemcpy(dRAll, rAll.data(), rAll.size() * sizeof(u16), cudaMemcpyHostToDevice));
     CUCHECK(cudaMalloc(&dFAll, fAll.size()));
     CUCHECK(cudaMemcpy(dFAll, fAll.data(), fAll.size(), cudaMemcpyHostToDevice));
-    CUCHECK(cudaMalloc(&dOut, (u64)candCap * sizeof(DevCand)));
-    CUCHECK(cudaMalloc(&dOutCount, 4));
+    CUCHECK(cudaMalloc(&dOut, candCap * sizeof(DevCand)));
+    CUCHECK(cudaMalloc(&dOutCount, 8));
     CUCHECK(cudaMalloc(&dIter, 8));
     CUCHECK(cudaMalloc(&dColBase, (size_t)(2 + e.Bmax) * sizeof(u64)));
   }
@@ -307,6 +309,9 @@ struct DevCtx {
       if (p) cudaFree(p);
   }
 };
+
+static void verifyCandidates(Engine &e, std::vector<DevCand> &cands, Engine::TileBuf &tb);
+static void gapPass(Engine &e, u64 xLo, u64 xHi, Engine::TileBuf &tb);
 
 struct GpuHarness {
   Engine &e;
@@ -373,15 +378,18 @@ struct GpuHarness {
     for (auto &w : windows) maxSliceKeys = std::max(maxSliceKeys, w.sliceEnd - w.sliceStart);
   }
 
-  // run one (window, x-block) tile on a prepared device; returns candidates
-  std::vector<DevCand> runTile(DevCtx &d, const Window &w, u64 bloomBlocks, u64 xLo, u64 xHi,
-                               unsigned long long &iters) {
+  // run one (window, x-range) batch on a prepared device.
+  // On candidate-buffer overflow returns false with `overflowCount` set — the
+  // caller subdivides and retries. Overflow NEVER silently drops candidates and
+  // never marks a tile done: the batch is re-run in smaller pieces.
+  bool tryRun(DevCtx &d, const Window &w, u64 bloomBlocks, u64 xLo, u64 xHi,
+              std::vector<DevCand> &out, unsigned long long &iters, u64 &overflowCount) {
     CUCHECK(cudaSetDevice(d.device));
     std::vector<u64> colBase(xHi - xLo + 1);
     colBase[0] = 0;
     for (u64 i = 0; i < xHi - xLo; i++) colBase[i + 1] = colBase[i] + (xLo + i);
     CUCHECK(cudaMemcpy(d.dColBase, colBase.data(), colBase.size() * 8, cudaMemcpyHostToDevice));
-    CUCHECK(cudaMemset(d.dOutCount, 0, 4));
+    CUCHECK(cudaMemset(d.dOutCount, 0, 8));
     CUCHECK(cudaMemset(d.dIter, 0, 8));
     KernelArgs A{};
     A.POW = d.dPOW;
@@ -413,49 +421,69 @@ struct GpuHarness {
     probeKernel<<<1024, 256>>>(A);
     CUCHECK(cudaGetLastError());
     CUCHECK(cudaDeviceSynchronize());
-    u32 cnt = 0;
-    CUCHECK(cudaMemcpy(&cnt, d.dOutCount, 4, cudaMemcpyDeviceToHost));
+    unsigned long long cnt = 0;
+    CUCHECK(cudaMemcpy(&cnt, d.dOutCount, 8, cudaMemcpyDeviceToHost));
     unsigned long long it = 0;
     CUCHECK(cudaMemcpy(&it, d.dIter, 8, cudaMemcpyDeviceToHost));
     iters = it;
-    if (cnt > d.candCap)
-      die("candidate overflow (%u > %u); rerun with --cand-cap", cnt, d.candCap);
-    std::vector<DevCand> out(cnt);
-    if (cnt)
+    overflowCount = 0;
+    if (cnt > d.candCap) { overflowCount = cnt; return false; }
+    out.resize(cnt);
+    if (cnt) {
+      double td = omp_get_wtime();
       CUCHECK(cudaMemcpy(out.data(), d.dOut, (u64)cnt * sizeof(DevCand), cudaMemcpyDeviceToHost));
-    return out;
+      xferSec += omp_get_wtime() - td;
+      xferBytes += (u64)cnt * sizeof(DevCand);
+    }
+    return true;
+  }
+  double xferSec = 0;   // measured device->host candidate transfer
+  u64 xferBytes = 0;
+  double kernelSec = 0; // measured kernel time (incl. overflowed retries)
+  double verifySec = 0; // measured host exact re-derivation
+
+  // adaptive: run [xLo,xHi) in as few batches as the candidate buffer allows,
+  // verifying each batch on the CPU before the next launch. Splits by equal
+  // triple mass (~x^3) using the measured overflow factor, so one retry
+  // normally suffices instead of repeated halving.
+  void runRangeAdaptive(DevCtx &d, const Window &w, u64 bloomBlocks, u64 xLo, u64 xHi,
+                        Engine::TileBuf &tb, unsigned long long &itersAcc) {
+    std::vector<DevCand> cands;
+    unsigned long long iters = 0;
+    u64 over = 0;
+    double tk = omp_get_wtime();
+    bool ok = tryRun(d, w, bloomBlocks, xLo, xHi, cands, iters, over);
+    kernelSec += omp_get_wtime() - tk;
+    if (ok) {
+      itersAcc += iters;
+      tb.st.keyMatches += cands.size();
+      double tv = omp_get_wtime();
+      verifyCandidates(e, cands, tb);
+      verifySec += omp_get_wtime() - tv;
+      return;
+    }
+    if (xHi - xLo <= 1)
+      die("single column x=%llu overflows the candidate buffer (count=%llu cap=%llu); "
+          "raise --cand-cap — column-level subdivision is not implemented",
+          (unsigned long long)xLo, (unsigned long long)over, (unsigned long long)d.candCap);
+    int nSplit = (int)(over / d.candCap) + 2;
+    if (nSplit > 4096) nSplit = 4096;
+    if ((u64)nSplit > xHi - xLo) nSplit = (int)(xHi - xLo);
+    // equal triple mass: mass(x) ~ x^2, so cut on cube roots
+    double lo3 = (double)xLo * xLo * xLo, hi3 = (double)xHi * xHi * xHi;
+    u64 prev = xLo;
+    for (int i = 1; i <= nSplit; i++) {
+      u64 cut = i == nSplit ? xHi : (u64)std::cbrt(lo3 + (hi3 - lo3) * i / nSplit);
+      if (cut <= prev) cut = prev + 1;
+      if (cut > xHi) cut = xHi;
+      if (cut > prev) runRangeAdaptive(d, w, bloomBlocks, prev, cut, tb, itersAcc);
+      prev = cut;
+      if (prev >= xHi) break;
+    }
   }
 };
 
-// parallel exact re-derivation of candidates + parallel sampled gap pass;
-// omp criticals inside recover/gapProbe are valid here (omp threads)
-static void verifyAndGap(Engine &e, std::vector<DevCand> &cands, u64 xLo, u64 xHi,
-                         bool doGap, Engine::TileBuf &tb) {
-  int T = omp_get_max_threads();
-  std::vector<Engine::TileBuf> parts(T);
-#pragma omp parallel
-  {
-    Engine::TileBuf &pt = parts[omp_get_thread_num()];
-#pragma omp for schedule(dynamic, 4096) nowait
-    for (long long ci = 0; ci < (long long)cands.size(); ci++) {
-      auto &c = cands[ci];
-      du128 s3 = e.POW[c.x] + e.POW[c.y] + e.POW[c.z];
-      e.recover(s3, (u8)(c.flags & 7), c.x, c.y, c.z, pt);
-    }
-    if (doGap) {
-#pragma omp for schedule(dynamic, 8)
-      for (long long x = (long long)xLo; x < (long long)xHi; x++) {
-        for (u64 y = 1; y <= (u64)x; y++) {
-          if (!sampledXY((u64)x, y, e.P.sampleShift)) continue;
-          du128 C2 = e.POW[x] + e.POW[y];
-          if (C2 + 1 > e.maxProbe) break;
-          u64 zcap = e.rootFloor(e.maxProbe - C2);
-          if (zcap > y) zcap = y;
-          for (u64 z = 1; z <= zcap; z++) e.gapProbe(C2 + e.POW[z], (u64)x, y, z, pt);
-        }
-      }
-    }
-  }
+static void mergeParts(std::vector<Engine::TileBuf> &parts, Engine::TileBuf &tb) {
   for (auto &pt : parts) {
     tb.lines.insert(tb.lines.end(), pt.lines.begin(), pt.lines.end());
     tb.st.exactHits += pt.st.exactHits;
@@ -464,9 +492,51 @@ static void verifyAndGap(Engine &e, std::vector<DevCand> &cands, u64 xLo, u64 xH
     tb.st.degenerateSkipped += pt.st.degenerateSkipped;
     tb.st.sampledProbes += pt.st.sampledProbes;
     tb.st.gapReports += pt.st.gapReports;
+    tb.st.aIters += pt.st.aIters;
     for (int b = 0; b < 128; b++) tb.hist[b] += pt.hist[b];
   }
-  tb.st.keyMatches += cands.size();
+}
+
+// parallel exact re-derivation of GPU candidates (the only path to a record)
+static void verifyCandidates(Engine &e, std::vector<DevCand> &cands, Engine::TileBuf &tb) {
+  if (cands.empty()) return;
+  std::vector<Engine::TileBuf> parts(omp_get_max_threads());
+#pragma omp parallel
+  {
+    Engine::TileBuf &pt = parts[omp_get_thread_num()];
+    u64 aStart = tl_aIters; // measure real verify cost (a-loop iterations)
+#pragma omp for schedule(dynamic, 4096)
+    for (long long ci = 0; ci < (long long)cands.size(); ci++) {
+      auto &c = cands[ci];
+      du128 s3 = e.POW[c.x] + e.POW[c.y] + e.POW[c.z];
+      e.recover(s3, (u8)(c.flags & 7), c.x, c.y, c.z, pt);
+    }
+    pt.st.aIters += tl_aIters - aStart;
+  }
+  mergeParts(parts, tb);
+}
+
+// sampled unfiltered gap pass on the host (identical code path to the CPU
+// engine, so gap records stay byte-identical across engines)
+static void gapPass(Engine &e, u64 xLo, u64 xHi, Engine::TileBuf &tb) {
+  if (e.P.sampleShift < 0) return;
+  std::vector<Engine::TileBuf> parts(omp_get_max_threads());
+#pragma omp parallel
+  {
+    Engine::TileBuf &pt = parts[omp_get_thread_num()];
+#pragma omp for schedule(dynamic, 8)
+    for (long long x = (long long)xLo; x < (long long)xHi; x++) {
+      for (u64 y = 1; y <= (u64)x; y++) {
+        if (!sampledXY((u64)x, y, e.P.sampleShift)) continue;
+        du128 C2 = e.POW[x] + e.POW[y];
+        if (C2 + 1 > e.maxProbe) break;
+        u64 zcap = e.rootFloor(e.maxProbe - C2);
+        if (zcap > y) zcap = y;
+        for (u64 z = 1; z <= zcap; z++) e.gapProbe(C2 + e.POW[z], (u64)x, y, z, pt);
+      }
+    }
+  }
+  mergeParts(parts, tb);
 }
 
 // closed-form window count: pure function of B and campaign (never of VRAM)
@@ -478,7 +548,7 @@ static int defaultWindows(u64 B, int near) {
   return w < 1 ? 1 : w;
 }
 
-static void gpuSearch(Params P, std::vector<int> devices, u32 candCap) {
+static void gpuSearch(Params P, std::vector<int> devices, u64 candCap) {
   if (P.gpuWindows <= 0) P.gpuWindows = defaultWindows(P.B, P.near);
   Engine e(P);
   if (P.threads) omp_set_num_threads(P.threads);
@@ -522,7 +592,9 @@ static void gpuSearch(Params P, std::vector<int> devices, u32 candCap) {
 
   double t0 = omp_get_wtime();
   u64 totalIters = 0;
+  int processed = 0;
   for (int w = 0; w < nW; w++) {
+    if (P.maxTiles && processed >= P.maxTiles) break;
     // skip fully-done windows without touching the devices
     bool any = false;
     for (int b = 0; b < XB; b++) any = any || !e.tileDone[(size_t)w * XB + b];
@@ -536,22 +608,40 @@ static void gpuSearch(Params P, std::vector<int> devices, u32 candCap) {
     for (int b = 0; b < XB; b++)
       if (!e.tileDone[(size_t)w * XB + b]) todo.push_back(b);
     for (size_t i = 0; i < todo.size(); i++) {
+      if (P.maxTiles && processed >= P.maxTiles) break;
       int b = todo[i];
       int tile = w * XB + b;
       DevCtx &d = *ctx[i % ctx.size()];
       Engine::TileBuf tb;
       unsigned long long iters = 0;
-      auto cands = g.runTile(d, g.windows[w], bloomBlocks[i % ctx.size()], e.tileLo[b], e.tileLo[b + 1], iters);
+      double tk = omp_get_wtime();
+      g.runRangeAdaptive(d, g.windows[w], bloomBlocks[i % ctx.size()], e.tileLo[b], e.tileLo[b + 1],
+                         tb, iters);
+      double tv = omp_get_wtime();
       tb.st.iters = iters;
       totalIters += iters;
-      // gap pass belongs to window 0 only (it is window-independent; doing it
+      // gap pass belongs to window 0 only (it is window-independent; running it
       // once per x-block across all windows would duplicate records)
-      verifyAndGap(e, cands, e.tileLo[b], e.tileLo[b + 1], w == 0 && P.sampleShift >= 0, tb);
+      if (w == 0) gapPass(e, e.tileLo[b], e.tileLo[b + 1], tb);
+      double tg = omp_get_wtime();
       e.commitTile(tile, tb);
       e.tileDone[tile] = 1;
-      if (!P.quiet && (i % 64 == 0))
-        fprintf(stderr, "  [gpu w%d/%d] block %zu/%zu elapsed %.0fs\n", w + 1, nW, i, todo.size(),
-                omp_get_wtime() - t0);
+      processed++;
+      if (!P.quiet && (P.maxTiles || i % 64 == 0)) {
+        double kS = g.kernelSec, vS = g.verifySec, xS = g.xferSec;
+        g.kernelSec = g.verifySec = g.xferSec = 0;
+        u64 xB = g.xferBytes; g.xferBytes = 0;
+        fprintf(stderr,
+                "  [w%d/%d blk %zu/%zu x=[%" PRIu64 ",%" PRIu64 ")] iters=%llu cands=%" PRIu64
+                " (%.3g/iter) | kernel %.1fs xfer %.1fs (%.2f GB) verify %.1fs"
+                " (%.3g rec/s, %.1f a-iters/rec) gap %.1fs | wall %.0fs\n",
+                w + 1, nW, i, todo.size(), e.tileLo[b], e.tileLo[b + 1], (unsigned long long)iters,
+                tb.st.keyMatches, iters ? (double)tb.st.keyMatches / iters : 0.0,
+                kS - xS, xS, xB / 1e9, vS,
+                vS > 0 ? tb.st.recoveries / vS : 0.0,
+                tb.st.recoveries ? (double)tb.st.aIters / tb.st.recoveries : 0.0,
+                tg - tv, omp_get_wtime() - t0);
+      }
     }
   }
   if (e.manifestF) { fclose(e.manifestF); e.manifestF = nullptr; }
@@ -567,7 +657,7 @@ static void gpuSearch(Params P, std::vector<int> devices, u32 candCap) {
 
 // in-memory GPU-vs-CPU equivalence for one config (multi-window aware)
 static int gpuVsCpu(int K, u64 B, int near, int sampleShift, int deltaBits, int device,
-                    bool noBloom, int nWindows) {
+                    bool noBloom, int nWindows, u64 candCap = 8u << 20) {
   Params P;
   P.K = K; P.B = B; P.near = near; P.sampleShift = sampleShift; P.deltaBits = deltaBits;
   P.inMemoryOnly = true; P.quiet = true; P.tiles = 7; P.noBloom = noBloom;
@@ -578,7 +668,7 @@ static int gpuVsCpu(int K, u64 B, int near, int sampleShift, int deltaBits, int 
   g.flattenChain();
   g.planWindows(nWindows);
   DevCtx d;
-  d.init(eg, device, 8u << 20, g.maxSliceKeys, g.rAll, g.fAll);
+  d.init(eg, device, candCap, g.maxSliceKeys, g.rAll, g.fAll);
   unsigned long long itersTotal = 0;
   int XB = (int)eg.tileMass.size();
   for (int w = 0; w < nWindows; w++) {
@@ -587,9 +677,9 @@ static int gpuVsCpu(int K, u64 B, int near, int sampleShift, int deltaBits, int 
     for (int b = 0; b < XB; b++) {
       Engine::TileBuf tb;
       unsigned long long iters = 0;
-      auto cands = g.runTile(d, g.windows[w], bb, eg.tileLo[b], eg.tileLo[b + 1], iters);
+      g.runRangeAdaptive(d, g.windows[w], bb, eg.tileLo[b], eg.tileLo[b + 1], tb, iters);
       itersTotal += iters;
-      verifyAndGap(eg, cands, eg.tileLo[b], eg.tileLo[b + 1], w == 0 && sampleShift >= 0, tb);
+      if (w == 0) gapPass(eg, eg.tileLo[b], eg.tileLo[b + 1], tb);
     }
   }
   Engine *ec = runEngine(P);
@@ -613,8 +703,9 @@ static int gpuVsCpu(int K, u64 B, int near, int sampleShift, int deltaBits, int 
             gg.size(), gc.size());
   }
   if (!bad)
-    fprintf(stderr, "OK  K=%d B=%-5" PRIu64 " near=%d W=%-2d bloom=%d: %zu hits, %zu gaps identical (iters=%llu)\n",
-            K, B, near, nWindows, !noBloom, hg.size(), gg.size(), itersTotal);
+    fprintf(stderr, "OK  K=%d B=%-5" PRIu64 " near=%d W=%-2d bloom=%d cap=%-9" PRIu64
+                    ": %zu hits, %zu gaps identical (iters=%llu)\n",
+            K, B, near, nWindows, !noBloom, candCap, hg.size(), gg.size(), itersTotal);
   delete ec;
   return bad;
 }
@@ -636,6 +727,12 @@ static void gputest(int device) {
   bad += gpuVsCpu(6, 401, 1, 4, 26, device, false, 8);
   bad += gpuVsCpu(6, 401, 0, 3, 26, device, false, 8);
   bad += gpuVsCpu(6, 1256, 1, -1, 20, device, false, 16);
+  // FORCED-OVERFLOW gates: tiny caps make adaptive subdivision fire many times
+  // per tile. Results must stay byte-identical to the unsplit CPU reference —
+  // this is what proves retries preserve exact coverage.
+  bad += gpuVsCpu(2, 61, 1, 0, 3, device, false, 1, 1 << 16);
+  bad += gpuVsCpu(6, 401, 1, 4, 26, device, false, 3, 1 << 16);
+  bad += gpuVsCpu(6, 1256, 1, -1, 20, device, false, 4, 1 << 16);
   if (bad) { fprintf(stderr, "%d GPU GATE FAILURES\n", bad); exit(1); }
   fprintf(stderr, "ALL GPU GATES PASSED\n");
 }
@@ -650,7 +747,7 @@ int main(int argc, char **argv) {
   Params P;
   int device = 0;
   std::vector<int> devices{0};
-  u32 candCap = 64u << 20;
+  u64 candCap = 64ull << 20;
   bool autoResume = false;
   std::vector<u64> Blist;
   for (int i = 2; i < argc; i++) {
@@ -666,6 +763,7 @@ int main(int argc, char **argv) {
     else if (a == "--delta-bits") P.deltaBits = (int)parseInt(next(), 0, 120, "--delta-bits");
     else if (a == "--threads") P.threads = (int)parseInt(next(), 0, 4096, "--threads");
     else if (a == "--tiles") P.tiles = (int)parseInt(next(), 0, 1000000, "--tiles");
+    else if (a == "--max-tiles") P.maxTiles = (int)parseInt(next(), 0, 1000000, "--max-tiles");
     else if (a == "--windows") P.gpuWindows = (int)parseInt(next(), 1, 4096, "--windows");
     else if (a == "--device") device = (int)parseInt(next(), 0, 15, "--device");
     else if (a == "--devices") {
@@ -673,7 +771,7 @@ int main(int argc, char **argv) {
       for (u64 v : parseList(next())) devices.push_back((int)v);
       if (devices.empty()) die("--devices needs at least one id");
     }
-    else if (a == "--cand-cap") candCap = (u32)parseInt(next(), 1 << 16, 1 << 28, "--cand-cap");
+    else if (a == "--cand-cap") candCap = (u64)parseInt(next(), 1 << 12, 1ll << 31, "--cand-cap");
     else if (a == "--no-bloom") P.noBloom = true;
     else if (a == "--resume") P.resume = true;
     else if (a == "--auto-resume") autoResume = true;
